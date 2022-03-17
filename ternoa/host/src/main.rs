@@ -3,6 +3,15 @@ use proto::{Command, UUID};
 use std::ffi::CString;
 mod ternoa_types;
 mod rpc;
+use subxt::{
+    ClientBuilder,
+    DefaultConfig,
+    DefaultExtra,
+};
+use serde::{Deserialize, Serialize, Serializer};
+
+#[subxt::subxt(runtime_metadata_path = "ternoa_metadata.scale")]
+pub mod ternoa {}
 
 const TEST_OBJECT_SIZE: usize = 7000;
 
@@ -36,58 +45,51 @@ fn write_secure_object(
     Ok(())
 }
 
-fn delete_secure_object(session: &mut Session, obj_id: &[u8]) -> optee_teec::Result<()> {
-    let p0 = ParamTmpRef::new_input(obj_id);
-    let mut operation = Operation::new(0, p0, ParamNone, ParamNone, ParamNone);
-
-    session.invoke_command(Command::Delete as u32, &mut operation)?;
-
-    println!("- Delete the object");
-    Ok(())
-}
-
-fn main() -> optee_teec::Result<()> {
+async fn demo() -> optee_teec::Result<()> {
     let mut ctx = Context::new()?;
     let uuid = Uuid::parse_str(UUID).unwrap();
     let mut session = ctx.open_session(uuid)?;
 
-    let obj1_id = CString::new("object#1").unwrap().into_bytes_with_nul();
-    let obj1_data = rpc::get_block_data().into();
-    let mut read_data = [0x00u8; TEST_OBJECT_SIZE];
+    let api = ClientBuilder::new()
+    .build()
+    .await?
+    .to_runtime_api::<ternoa::RuntimeApi<DefaultConfig, DefaultExtra<DefaultConfig>>>();
 
-    println!("\nTest on object \"object#1\"");
-    write_secure_object(&mut session, obj1_id.as_slice(), &obj1_data)?;
-    read_secure_object(&mut session, obj1_id.as_slice(), &mut read_data)?;
+    
+    // Subscribe to any events that occur:
+    let mut event_sub = api.events().subscribe().await?;
 
-    if obj1_data.iter().zip(read_data.iter()).all(|(a, b)| a == b) {
-        println!("- Content read-out correctly");
-    } else {
-        println!("- Unexpected content found in secure storage");
-    }
-    delete_secure_object(&mut session, &obj1_id)?;
+    while let Some(events) = event_sub.next().await {
 
-    let obj2_id = CString::new("object#2").unwrap().into_bytes_with_nul();
+        let events = events?;
+        let block_hash = events.block_hash();
 
-    println!("\nTest on object \"object#2\"");
-    match read_secure_object(&mut session, obj2_id.as_slice(), &mut read_data) {
-        Err(e) => {
-            if e.kind() != ErrorKind::ItemNotFound {
-                println!("{}", e);
-                return Err(e);
-            } else {
-                println!("- Object not found in TA secure storage, create it");
-                let obj2_data = [0xB1u8; TEST_OBJECT_SIZE];
-                write_secure_object(&mut session, &obj2_id, &obj2_data)?;
+        for event in events.iter_raw() {
+            let event = event?;
+            let is_balance_transfer = event
+                .as_event::<ternoa::nfts::events::Created>()?
+                .is_some();
+            let pallet = event.pallet;
+            let variant = event.variant;
+            println!("NFT Creation detected!");
+
+            // TODO : Find better way to encode nft data to enclave
+            let obj1_id = CString::new(variant.nft_id).unwrap().into_bytes_with_nul();
+            let obj1_data = rpc::get_block_data().into();
+            let mut read_data = [0x00u8; TEST_OBJECT_SIZE];
+
+            println!("\nTest on object \"object#1\"");
+            write_secure_object(&mut session, obj1_id.as_slice(), &obj1_data)?;
+            read_secure_object(&mut session, obj1_id.as_slice(), &mut read_data)?;
+
+            if obj1_data.iter().zip(read_data.iter()).all(|(a, b)| a == b) {
+                println!("- Content read-out correctly");
+                } else {
+                println!("- Unexpected content found in secure storage");
+                }
             }
         }
-
-        Ok(()) => {
-            println!("- Object found in TA secure storage, delete it");
-            delete_secure_object(&mut session, &obj2_id)?;
-        }
-    }
-
-    println!("\nWe're done, close and release TEE resources");
+    
     Ok(())
 }
 
